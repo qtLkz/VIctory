@@ -158,7 +158,10 @@ impl HostHeap {
         } else {
             // A host that caps its heaps at `PORTABLE_VIEWS` (every host:
             // that is the tier-2 limit) gets the largest heap it will make.
-            match make(count + MIN_DYNAMIC) {
+            // Never smaller than `HEAP_VIEWS`: shaders clamp to it, and the
+            // null buffer views sit just below it (a title of 737,857 to
+            // 934,463 views made a heap the null views fell outside).
+            match make((count + MIN_DYNAMIC).max(views)) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
@@ -2038,6 +2041,33 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Title heaps of the sizes named in the review of #2683 (737,856,
+    /// 800,000 and 934,464 views) keep the two null buffer views inside the
+    /// heap and above every dynamic slot, whatever the host's cap. On a host
+    /// that caps view heaps at 1,000,000 (NVIDIA), 800,000 and 934,464 take
+    /// the `MIN_DYNAMIC` path, where the heap used to end below the null
+    /// views.
+    #[test]
+    fn null_buffer_views_stay_in_the_heap_above_the_dynamic_slots() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        for count in [737_856, 800_000, 934_464] {
+            let heap = HostHeap::new(false, count).expect("a view heap");
+            // SAFETY: a plain query of a live heap.
+            let total = unsafe { heap.heap.GetDesc().NumDescriptors };
+            assert!(null < total, "{count} views: null view {null} past a heap of {total}");
+            assert!(
+                heap.count + heap.dynamic < null - 1,
+                "{count} views: the dynamic slots end at {}, over the null views at {} and {null}",
+                heap.count + heap.dynamic,
+                null - 1,
+            );
+            assert!(heap.dynamic > 0, "{count} views: no dynamic slots");
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
