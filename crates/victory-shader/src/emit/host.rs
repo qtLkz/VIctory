@@ -1156,12 +1156,14 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        // The root signature declares at least one constant (`user_data_dwords().max(1)`):
+                        // an empty list is set as that one zero, not as 0 values through an empty Vec's
+                        // dangling pointer, which a hardware driver reads (0xC0000005 on NVIDIA and AMD; WARP
+                        // ignores it, #2571).
+                        let data: &[u32] = if data.is_empty() { &[0] } else { data };
+                        list.SetGraphicsRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0)
+                    }
                     Root::Table { sampler, index } => {
                         let (heap, size) = if *sampler {
                             (&sampler_heap, sampler_size)
@@ -1919,12 +1921,14 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        // The root signature declares at least one constant (`user_data_dwords().max(1)`):
+                        // an empty list is set as that one zero, not as 0 values through an empty Vec's
+                        // dangling pointer, which a hardware driver reads (0xC0000005 on NVIDIA and AMD; WARP
+                        // ignores it, #2571).
+                        let data: &[u32] = if data.is_empty() { &[0] } else { data };
+                        list.SetComputeRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0)
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
