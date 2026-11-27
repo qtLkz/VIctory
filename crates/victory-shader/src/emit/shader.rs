@@ -18,7 +18,15 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 28) - 1;
+/// Shift of the 2-bit raw-view start bias (in dwords: 0..=3 -> 0, 4, 8, or 12
+/// bytes) in a view-stride table dword. Used when a structured buffer whose
+/// offset in its host copy is 4-byte aligned (not 16-byte aligned) is viewed
+/// raw from the preceding 16-byte boundary so overlapping views share one copy.
+pub const VIEW_RAW_OFFSET_SHIFT: u32 = 28;
+/// The bits of a view-stride table dword holding the raw-view start bias in
+/// dwords.
+pub const VIEW_RAW_OFFSET_BITS: u32 = 3 << VIEW_RAW_OFFSET_SHIFT;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
@@ -566,10 +574,10 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12), and
-        // typed buffers read (their format kind, `Lower::view_word`).
+        // Buffer views (kinds 10-12, both SRV and UAV): needed for write marks,
+        // typed integer format bits, and raw-view start bias (`Lower::view_word`).
         let kind = props.0 & 0xFF;
-        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
+        if !sampler && (10..=12).contains(&kind) {
             self.view_index.insert(h, index);
         }
         // Texture shader views (kinds 1-9).

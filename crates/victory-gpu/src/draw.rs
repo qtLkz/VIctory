@@ -1049,7 +1049,7 @@ impl State {
             return;
         };
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
-        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+        let Some(heap) = heap else {
             once!("an unordered access clear without a bound view heap");
             return;
         };
@@ -1059,9 +1059,7 @@ impl State {
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
-        visible.make_at(slot, &view);
-        let at = host.cpu_view();
-        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+        let Some((at, resource)) = visible.make_clear_at(slot, &view) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
         };
@@ -2028,6 +2026,8 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod structured_clear;
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
@@ -3591,24 +3591,38 @@ void main(uint3 id : SV_DispatchThreadID) {
         .unwrap();
         // SAFETY: a live heap.
         let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
-        // Four 456-byte elements placed at `address` (resource and view
-        // descriptions as the title passes them to device 0x230).
-        let view = |address: u64| {
+        // Four 456-byte structured elements placed at `address` (resource and
+        // view descriptions as the title passes them to device 0x230).
+        let structured_view = |address: u64| {
             let resource: [u32; 14] = [1, 0, 0, 0, 4 * 456, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
             let mut desc = [0u32; 16];
             desc[..10].copy_from_slice(&[0, 1, 5768, 0, 0, 0, 4, 456, 0, 0]);
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             View::Placed(false, resource, desc)
         };
-        let width = |address: u64| {
-            let made = crate::descriptor::host::make_view(&view(address), at).expect("a view");
+        // Four 16-byte typed (R32G32B32A32_FLOAT) elements placed at `address`.
+        let typed_view = |address: u64| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4 * 16, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[2, 1, 5768, 0, 0, 0, 4, 0, 0, 0]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let width = |v: &View| {
+            let made = crate::descriptor::host::make_view(v, at).expect("a view");
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
-        assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
-        let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
-        assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
+        // Structured buffers are viewed raw with a 0..12-byte start bias in
+        // `VIEW_STRIDES`, so any 4-byte-aligned start shares the buffer's copy.
+        assert_eq!(width(&structured_view(start + 456)), 1 << 16, "4-byte-aligned structured: buffer's copy");
+        assert_eq!(width(&structured_view(start + 100)), 1 << 16, "4-byte-aligned structured: buffer's copy");
+        // Typed views must start on an element of their copy: on-element uses
+        // the buffer's copy, off-element gets a copy of its own bytes.
+        assert_eq!(width(&typed_view(start + 16)), 1 << 16, "on an element: the buffer's copy");
+        assert_ne!(width(&typed_view(start + 100)), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
+        let (copy, address, len) = crate::descriptor::host::view_copy(&typed_view(start + 100)).unwrap();
+        assert_eq!((copy.range(), address, len), ((start + 100, 4 * 16), start + 100, 4 * 16));
         drop(copy);
         // A slot made from the view holds its copy: after more than a
         // thousand other views' copies, draws still find (and refresh) the
@@ -3619,14 +3633,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
         assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
         let slots = crate::descriptor::heap(heap).host().expect("a host view heap");
-        slots.make_at(0, &view(start + 100));
-        let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0);
-        for k in 1..1200 {
-            if (100 + 4 * k) % 456 != 0 {
-                crate::descriptor::host::view_copy(&view(start + 100 + 4 * k)).unwrap();
+        slots.make_at(0, &typed_view(start + 100));
+        let shown = std::sync::Arc::downgrade(&crate::descriptor::host::view_copy(&typed_view(start + 100)).unwrap().0);
+        for k in 1..1500 {
+            if (100 + 4 * k) % 16 != 0 {
+                crate::descriptor::host::view_copy(&typed_view(start + 100 + 4 * k)).unwrap();
             }
         }
-        let found = crate::descriptor::host::view_copy(&view(start + 100)).unwrap().0;
+        let found = crate::descriptor::host::view_copy(&typed_view(start + 100)).unwrap().0;
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         slots.make_null(0);

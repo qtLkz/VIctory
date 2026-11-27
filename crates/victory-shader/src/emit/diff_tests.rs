@@ -1440,6 +1440,46 @@ fn translated_compute_matches_pc() {
         samplers: &samplers,
         groups: [2, 2, 1],
     };
+    let pc_views: Vec<View> = views
+        .iter()
+        .map(|v| match *v {
+            View::Buffer {
+                data,
+                stride: Stride::Structured(s),
+            } => View::Buffer {
+                data,
+                stride: Stride::PcStructured(s),
+            },
+            ref other => match other {
+                View::Texture(w, h, t) => View::Texture(*w, *h, t),
+                View::Mipped(w, h, m, t) => View::Mipped(*w, *h, *m, t),
+                View::Cube(s, t) => View::Cube(*s, t),
+                View::MippedCube(s, m, t) => View::MippedCube(*s, *m, t),
+                View::Levels(s, m) => View::Levels(*s, *m),
+                View::RawUav(n) => View::RawUav(*n),
+                View::TextureUav(w, h) => View::TextureUav(*w, *h),
+                View::UintTextureUav(w, h) => View::UintTextureUav(*w, *h),
+                View::Uint2TextureUav(w, h) => View::Uint2TextureUav(*w, *h),
+                View::HalfUav(n) => View::HalfUav(*n),
+                View::TypedUav(f, n, b) => View::TypedUav(*f, *n, *b),
+                View::Cbv(d) => View::Cbv(d),
+                View::Buffer { data, stride } => View::Buffer {
+                    data,
+                    stride: *stride,
+                },
+                View::Memory(d) => View::Memory(d),
+                View::NullPair => View::NullPair,
+                View::Pair => View::Pair,
+                View::NullBuffers => View::NullBuffers,
+            },
+        })
+        .collect();
+    let pc_dispatch = |roots| Dispatch {
+        roots,
+        views: &pc_views,
+        samplers: &samplers,
+        groups: [2, 2, 1],
+    };
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
     let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
@@ -1512,7 +1552,7 @@ fn translated_compute_matches_pc() {
             .dispatch(
                 &root_p,
                 &pso_p,
-                &dispatch(vec![
+                &pc_dispatch(vec![
                     (0, Root::Constants(k.to_vec())),
                     (1, table(false, 1)),
                     (2, table(true, 1)),

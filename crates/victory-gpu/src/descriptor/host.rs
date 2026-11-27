@@ -13,6 +13,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+#[cfg(test)]
+#[path = "overlap_test.rs"]
+mod overlap_test;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -446,16 +450,41 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, bias) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.set_stride(index, Some(view), bias);
         self.set_mark(index, mark);
         // A table made afresh: shaders reading a view's address there (e.g.
         // the BVH builder's base) index the view addresses at this slot.
         self.note_address(index, Some(view));
+    }
+
+    /// Matching CPU and shader-visible UAVs for a native clear. These slots
+    /// are private to the clear, so a structured buffer can use an exact
+    /// one-dword typed view without changing the slots translated shaders use.
+    pub(crate) fn make_clear_at(
+        &self,
+        index: u32,
+        view: &View,
+    ) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, ID3D12Resource)> {
+        let host = host()?;
+        let at = host.cpu_view();
+        let kept = make(view, at, true)??;
+        // SAFETY: the source is CPU-only, and the destination is this list's dynamic slot.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                self.cpu(index),
+                at,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        let resource = kept.0.clone();
+        self.keep(index, Some(kept));
+        Some((at, resource))
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -525,7 +554,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.set_stride(index, None, 0);
         self.set_mark(index, None);
         self.note_address(index, None);
         if index < self.count {
@@ -535,9 +564,15 @@ impl HostHeap {
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
     /// for slot `index` in the view-stride table, with the integer-format
-    /// bits of a typed buffer view ([`view_kind`]).
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
+    /// bits of a typed buffer view ([`view_kind`]) and the 0..12-byte
+    /// raw-view start bias (`raw_bias`, a multiple of 4).
+    fn set_stride(&self, index: u32, view: Option<&View>, raw_bias: u32) {
+        use victory_shader::emit::{VIEW_RAW_OFFSET_SHIFT, VIEW_STRIDE_BITS};
+        let bias = ((raw_bias / 4) & 3) << VIEW_RAW_OFFSET_SHIFT;
+        self.write_stride(
+            index,
+            view.map_or(0, |v| (view_stride(v) & VIEW_STRIDE_BITS) | view_kind(v) | bias),
+        );
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -850,18 +885,18 @@ impl HostHeap {
             }
         }
         {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, bias) = if later {
+                (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            self.set_stride(index, Some(&view), bias);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1223,11 +1258,43 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// D3D12 raw buffer views (`D3D12_BUFFER_{SRV,UAV}_FLAG_RAW`) require
+/// `FirstElement * 4` to be 16-byte aligned (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`).
+/// Structured buffers starting at any 4-byte-aligned offset (`RAW_WORD_ALIGN`)
+/// share the containing host copy by rounding `FirstElement` down to 16 bytes
+/// and carrying the `0..12` byte remainder in `VIEW_STRIDES`.
+const RAW_VIEW_ALIGN: u64 = 16;
+const RAW_WORD_ALIGN: u64 = 4;
+
+/// The alignment [`crate::shadow::for_view`] uses for `view`, matching
+/// [`buffer_srv`] and [`buffer_uav`].
+fn view_align(view: &View) -> u64 {
+    let stride = u64::from(view_stride(view));
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(w)) => (false, w),
+        View::Unordered(_, _, Some(w)) => (true, w),
+        View::Placed(unordered, r, d) if r[0] == 1 => match d[..10].try_into() {
+            Ok(w) => (*unordered, w),
+            Err(_) => return stride,
+        },
+        _ => return stride,
+    };
+    // SAFETY: buffer view union member (`view` is a buffer view).
+    let structured = unsafe {
+        if unordered {
+            uav_desc(words).Anonymous.Buffer.StructureByteStride > 0
+        } else {
+            srv_desc(words).Anonymous.Buffer.StructureByteStride > 0
+        }
+    };
+    if structured { RAW_WORD_ALIGN } else { stride }
+}
+
 /// The host copy a buffer view's bytes are in (the one its host view
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, view_align(view))?;
     Some((shadow, address, len))
 }
 
@@ -1271,25 +1338,59 @@ fn buffer_srv(
         once!(len, "buffer view of elements without a size");
         return None;
     }
+    let structured = buffer.StructureByteStride > 0;
+    let total_bytes = u64::from(buffer.NumElements).checked_mul(element)?;
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    // Structured buffers are always viewed raw (R32_TYPELESS + FLAG_RAW) on
+    // the host so both table-bound and heap-indexed accesses use raw handles
+    // cleanly on NVIDIA, AMD, and WARP (NVIDIA misreads structured descriptors
+    // through raw handles as `element = byte_offset / 4`). Overlapping views
+    // at any 4-byte-aligned offset share one host copy: `FirstElement` rounds
+    // down to 16 bytes and the 0..12-byte remainder travels in `VIEW_STRIDES`.
+    // Views that cannot be represented raw are refused rather than leaving a
+    // native structured descriptor behind a raw shader handle.
+    if structured && (total_bytes == 0 || !total_bytes.is_multiple_of(4)) {
+        once!(total_bytes, element, "refused structured buffer view: byte length not a positive multiple of 4");
+        return None;
+    }
+    let align = if structured { RAW_WORD_ALIGN } else { element };
+    let Some((shadow, own)) = crate::shadow::for_view(start, total_bytes, align) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
         }
         return None;
     };
-    buffer.FirstElement = shadow.offset(start) / element;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    let offset = shadow.offset(start);
+    let (view_element, first, count, bias) = if structured {
+        if !offset.is_multiple_of(RAW_WORD_ALIGN) {
+            once!(offset, element, "refused structured buffer view: host offset not 4-byte aligned");
+            return None;
+        }
+        let bias = offset & (RAW_VIEW_ALIGN - 1);
+        let aligned = offset - bias;
+        let raw_dwords = total_bytes.checked_add(bias)? / 4;
+        let Ok(raw_count) = u32::try_from(raw_dwords) else {
+            once!(raw_dwords, element, "refused structured buffer view: exceeds u32 raw elements");
+            return None;
+        };
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = aligned / 4;
+        buffer.NumElements = raw_count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        (4, buffer.FirstElement, buffer.NumElements, bias as u32)
+    } else {
+        buffer.FirstElement = offset / element;
+        (element, buffer.FirstElement, buffer.NumElements, 0)
+    };
+    if !in_buffer(&shadow.buffer, first, count, view_element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-            tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+            tracing::info!(start = format_args!("{start:#x}"), first, count, element = view_element, "refused buffer view: empty or past its copy");
         }
-        once!(first, count, element, "buffer view empty or past its host copy");
+        once!(first, count, view_element, "buffer view empty or past its host copy");
         return None;
     }
     let host = host()?;
@@ -1298,6 +1399,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    RAW_BIAS.with(|b| b.set(bias));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1323,10 +1425,12 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    for_clear: bool,
 ) -> Option<Kept> {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
+    let structured = buffer.StructureByteStride > 0;
+    let element = if structured {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
@@ -1337,19 +1441,56 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    let total_bytes = u64::from(buffer.NumElements).checked_mul(element)?;
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    // View structured UAVs raw on the host, matching [`buffer_srv`] and
+    // `victory-shader`'s raw-handle lowering.
+    if structured && (total_bytes == 0 || !total_bytes.is_multiple_of(4)) {
+        once!(total_bytes, element, "refused structured UAV: byte length not a positive multiple of 4");
+        return None;
+    }
+    let align = if structured { RAW_WORD_ALIGN } else { element };
+    let (shadow, own) = crate::shadow::for_view(start, total_bytes, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement = shadow.offset(start) / element;
+    let offset = shadow.offset(start);
+    let (view_element, first, count, bias) = if structured {
+        if !offset.is_multiple_of(RAW_WORD_ALIGN) {
+            once!(offset, element, "refused structured UAV: host offset not 4-byte aligned");
+            return None;
+        }
+        // Translated shaders skip the rounded prefix using VIEW_STRIDES.
+        // Native clears have no shader to add the bias. A typed dword UAV
+        // can start at the actual word and keep the original logical length.
+        let bias = offset & (RAW_VIEW_ALIGN - 1);
+        let (format, flags, bias) = if for_clear && bias != 0 {
+            (DXGI_FORMAT_R32_UINT, D3D12_BUFFER_UAV_FLAG_NONE, 0)
+        } else {
+            (DXGI_FORMAT_R32_TYPELESS, D3D12_BUFFER_UAV_FLAG_RAW, bias)
+        };
+        let aligned = offset - bias;
+        let raw_dwords = total_bytes.checked_add(bias)? / 4;
+        let Ok(raw_count) = u32::try_from(raw_dwords) else {
+            once!(raw_dwords, element, "refused structured UAV: exceeds u32 raw elements");
+            return None;
+        };
+        desc.Format = format;
+        buffer.FirstElement = aligned / 4;
+        buffer.NumElements = raw_count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = flags;
+        (4, buffer.FirstElement, buffer.NumElements, bias as u32)
+    } else {
+        buffer.FirstElement = offset / element;
+        (element, buffer.FirstElement, buffer.NumElements, 0)
+    };
     buffer.CounterOffsetInBytes = 0;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
-        once!(first, count, element, "unordered buffer view empty or past its host copy");
+    if !in_buffer(&shadow.buffer, first, count, view_element) {
+        once!(first, count, view_element, "unordered buffer view empty or past its host copy");
         return None;
     }
     let host = host()?;
@@ -1358,7 +1499,8 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    MARK.with(|m| m.set(shadow.mark_entry(start)));
+    RAW_BIAS.with(|b| b.set(bias));
+    MARK.with(|m| m.set(shadow.mark_entry(start - u64::from(bias))));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1366,15 +1508,26 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    /// The 0..12-byte raw-view start bias of the structured buffer view
+    /// [`make`] last made on this thread ([`make_marked`]).
+    static RAW_BIAS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// [`make`], and the view-mark entry of the view if it is an unordered
-/// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
-/// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+/// [`make`], the view-mark entry of the view if it is an unordered buffer
+/// view whose writes shaders mark (`victory_shader::emit`, "Write marks"),
+/// and the 0..12-byte raw-view start bias for `VIEW_STRIDES`.
+fn make_marked(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
-    let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    RAW_BIAS.with(|b| b.set(0));
+    let kept = make(view, at, false);
+    (
+        kept,
+        MARK.with(std::cell::Cell::take),
+        RAW_BIAS.with(std::cell::Cell::take),
+    )
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1500,13 +1653,14 @@ fn typed_store(format: u32) -> bool {
 
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
+#[cfg(test)]
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten().map(|k| k.0)
+    make(view, at, false).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, for_clear: bool) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1572,7 +1726,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, for_clear)
                     }
                     _ => None,
                 };
@@ -1628,7 +1782,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at, for_clear);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -1639,7 +1793,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(address, len, uav_desc(words), at, for_clear)
             } else {
                 buffer_srv(address, len, srv_desc(words), at)
             }
@@ -2561,6 +2715,110 @@ mod tests {
                 "srv case {offset}"
             );
         }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn structured_buffer_views_stay_raw_on_host_and_keep_stride_table() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let _ = host.log_messages();
+        let va = placed_memory();
+        crate::shadow::register(va as usize, va, 4096);
+
+        // Structured SRV (stride 12, 32 elements) starting at an offset (+4,
+        // not divisible by 12) and a structured UAV (stride 20, 16 elements).
+        // `D3D12_SHADER_RESOURCE_VIEW_DESC` has 4 bytes of padding at word 3
+        // before the 8-byte `FirstElement` union member.
+        let buf_desc = [
+            1u32, 0, 0, 0, 4096, 0, 1, 1 | (1 << 16), 0, 1, 0, 1, 4, 0,
+        ];
+        let mut srv_words = [0u32; 16];
+        srv_words[0] = 0; // DXGI_FORMAT_UNKNOWN
+        srv_words[1] = 1; // D3D12_SRV_DIMENSION_BUFFER
+        srv_words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_words[4] = 0; // FirstElement lo
+        srv_words[5] = 0; // FirstElement hi
+        srv_words[6] = 32; // NumElements
+        srv_words[7] = 12; // StructureByteStride
+        srv_words[8] = 0; // Flags (not RAW)
+        srv_words[10] = (va + 4) as u32;
+        srv_words[11] = ((va + 4) >> 32) as u32;
+
+        let mut uav_words = [0u32; 16];
+        uav_words[0] = 0; // DXGI_FORMAT_UNKNOWN
+        uav_words[1] = 1; // D3D12_UAV_DIMENSION_BUFFER
+        uav_words[2] = 0; // FirstElement lo
+        uav_words[3] = 0; // FirstElement hi
+        uav_words[4] = 16; // NumElements
+        uav_words[5] = 20; // StructureByteStride
+        uav_words[6] = 0; // CounterOffset lo
+        uav_words[7] = 0; // CounterOffset hi
+        uav_words[8] = 0; // Flags (not RAW)
+        uav_words[10] = (va + 512) as u32;
+        uav_words[11] = ((va + 512) >> 32) as u32;
+
+        let mut slots = [[0u32; 8]; 4];
+        let s0 = slots[0].as_mut_ptr() as u64;
+        let s1 = slots[1].as_mut_ptr() as u64;
+        let s2 = slots[2].as_mut_ptr() as u64;
+        let s3 = slots[3].as_mut_ptr() as u64;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &buf_desc, &srv_words, s0);
+        crate::descriptor::create_placed_uav(std::ptr::null(), &buf_desc, &uav_words, s1);
+
+        // Structured SRV starting at +12 (3 dwords past the 16-byte boundary).
+        let mut srv12_words = srv_words;
+        srv12_words[10] = (va + 12) as u32;
+        srv12_words[11] = ((va + 12) >> 32) as u32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &buf_desc, &srv12_words, s2);
+
+        // Non-4-byte-length structured SRV (stride 2, count 3 => 6 bytes):
+        // must be refused rather than creating a native structured descriptor.
+        let mut odd_words = srv_words;
+        odd_words[6] = 3;
+        odd_words[7] = 2;
+        odd_words[10] = va as u32;
+        odd_words[11] = (va >> 32) as u32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &buf_desc, &odd_words, s3);
+
+        let v0 = crate::descriptor::view(s0).expect("srv view");
+        let v1 = crate::descriptor::view(s1).expect("uav view");
+        // The view-stride table MUST still record the title's original element strides.
+        assert_eq!(view_stride(&v0), 12);
+        assert_eq!(view_kind(&v0), 0);
+        assert_eq!(view_stride(&v1), 20);
+        assert_eq!(view_kind(&v1), 0);
+
+        assert!(heap.mirror(0, s0, true).is_some());
+        assert!(heap.mirror(1, s1, true).is_some());
+        assert!(heap.mirror(2, s2, true).is_some());
+        assert!(heap.mirror(3, s3, true).is_some());
+        let kept = heap.kept.lock().unwrap();
+        // All 4-byte-aligned structured views share the buffer's main copy (no
+        // private exact copy) so overlapping views stay coherent.
+        assert!(kept[0].as_ref().is_some_and(|(_, own)| own.is_none()), "+4 shares main copy");
+        assert!(kept[1].as_ref().is_some_and(|(_, own)| own.is_none()), "+512 shares main copy");
+        assert!(kept[2].as_ref().is_some_and(|(_, own)| own.is_none()), "+12 shares main copy");
+        assert!(kept[3].is_none(), "non-4-byte structured length is refused");
+
+        // Verify `VIEW_STRIDES` carries the exact stride + 0..12-byte raw bias.
+        let (_, stride_data) = heap.strides.as_ref().expect("stride table");
+        // SAFETY: mapped stride table covers slots 0..4.
+        let entry = |i: usize| unsafe { (*stride_data as *const u32).add(i).read_volatile() };
+        let shift = victory_shader::emit::VIEW_RAW_OFFSET_SHIFT;
+        assert_eq!(entry(0), 12 | (1 << shift), "+4 => bias 4 bytes (1 dword)");
+        assert_eq!(entry(1), 20 | (0 << shift), "+512 => bias 0 bytes");
+        assert_eq!(entry(2), 12 | (3 << shift), "+12 => bias 12 bytes (3 dwords)");
+        drop(kept);
+        drop(heap);
+        crate::shadow::unregister(va as usize, va);
+
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);

@@ -1363,7 +1363,7 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         .map(|v| match *v {
             View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
             View::Buffer { stride: Stride::Typed, .. } => 16,
-            View::Buffer { stride: Stride::Structured(n), .. } => n,
+            View::Buffer { stride: Stride::Structured(n) | Stride::PcStructured(n), .. } => n,
             View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
             _ => 0,
@@ -1378,8 +1378,11 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
+    /// Structured title buffer: viewed raw on the host (as `victory_gpu`
+    /// makes it) while keeping `n` in [`view_strides`].
     Structured(u32),
+    /// Structured host buffer for PC DXC reference shaders in `diff_tests`.
+    PcStructured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
 }
@@ -1789,7 +1792,13 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
+                            Stride::Structured(_) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
+                            ),
+                            Stride::PcStructured(s) => (
                                 DXGI_FORMAT_UNKNOWN,
                                 data.len() * 4 / s as usize,
                                 s,

@@ -13,7 +13,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
+use super::{
+    HostShader, StaticSampler, VIEW_INTEGER, VIEW_RAW_OFFSET_SHIFT, VIEW_STRIDES, lower, validator,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -298,6 +300,204 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
         assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Heap-indexed structured buffers with distinct strides in the same heap each
+/// address elements using their own stride from `VIEW_STRIDES` on hardware
+/// (NVIDIA) and WARP alike.
+#[test]
+fn heap_indexed_structured_buffers_with_distinct_strides() {
+    let shader = build(
+        HEAP_ELEMENT_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    // Slot 1: 12-byte elements (3 dwords), dword 1 is 200 + e.
+    let data12: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    // Slot 2: 20-byte elements (5 dwords), dword 1 is 500 + e.
+    let data20: Vec<u32> = (0..32)
+        .flat_map(|e| [400 + e, 500 + e, 600 + e, 700 + e, 800 + e])
+        .collect();
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data12,
+            stride: Stride::Structured(12),
+        },
+        View::Buffer {
+            data: &data20,
+            stride: Stride::Structured(20),
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (slot, base) in [(1u32, 200u32), (2u32, 500u32)] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => slot,
+                    RootType::Table => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![4, 12, 20],
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} slot {slot}: dispatch failed: {e}"));
+            let want: Vec<u32> = (0..32).map(|l| base + l).collect();
+            assert_eq!(words[0], want, "{label} slot {slot}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Table-bound structured buffer read by element (`idxen` + `offset:4`) or by
+/// byte (`offen` + `offset:4`), and its record count (`num_records` read as
+/// data) over a raw host descriptor: in elements, or in bytes without the raw
+/// view's start bias.
+#[test]
+fn table_bound_structured_buffer_reads_by_element_and_dimensions() {
+    // s0: table with Structured(12) SRV, s2: table with raw UAV.
+    // Lane 0..30: dword 1 of element `lane`; lane 31: buffer's element count (s10 = V# word 2).
+    const TABLE_STRUCT_DIMS_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBE8C_0302, // s_mov_b32 s12, s2
+        0xBE8D_0380, // s_mov_b32 s13, 0
+        0xF408_0406,
+        0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2004,
+        0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7D9A_009F, // v_cmp_ne_u32 vcc_lo, 31, v0
+        0x0204_040A, // v_cndmask_b32 v2, s10, v2, vcc_lo (vcc ? v2 : s10)
+        0xE070_1000,
+        0x8004_0201, // buffer_store_dword v2, v1, s[16:19], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let compile = |code: &[u32]| {
+        let mut srv_used = entry(ResourceType::Srv, 4, 0);
+        srv_used.stride = 12;
+        build(
+            code,
+            vec![param(RootType::Table, 0), param(RootType::Table, 2)],
+            vec![srv_used, entry(ResourceType::Uav, 4, 2)],
+            32,
+        )
+    };
+    let elements = compile(TABLE_STRUCT_DIMS_WAVE32);
+    // The same read by byte: buffer_load_dword v2, v1, s[8:11], 0 offen offset:4.
+    let mut by_byte = TABLE_STRUCT_DIMS_WAVE32.to_vec();
+    by_byte[10..12].copy_from_slice(&[0xE030_1004, 0x8002_0201]);
+    let bytes = compile(&by_byte);
+    // 32 elements of 12 bytes (3 dwords each), plus a biased copy preceded by
+    // 3 dwords (12 bytes = `3 << VIEW_RAW_OFFSET_SHIFT`) simulating a raw host
+    // view rounded down to the preceding 16-byte boundary.
+    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let mut biased_data = vec![0xDEAD_BEEF; 3];
+    biased_data.extend_from_slice(&data);
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(12),
+        },
+        View::Buffer {
+            data: &biased_data,
+            stride: Stride::Structured(12),
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (shader, by_element) in [(&elements, true), (&bytes, false)] {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            for (slot, tag) in [(1u32, "aligned"), (2u32, "bias-12")] {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    // The SRV's table is at heap index `slot` (32 * slot bytes in), the UAV's at 0.
+                    ud[u.index as usize] = if u.slot == 0 { 32 * slot } else { 0 };
+                }
+                let words = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (
+                                    1,
+                                    Root::View {
+                                        srv: true,
+                                        data: vec![4, 12, 12 | (3 << VIEW_RAW_OFFSET_SHIFT)],
+                                    },
+                                ),
+                            ],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} ({tag}): dispatch failed: {e}"));
+                let mut want: Vec<u32> = if by_element {
+                    (0..32).map(|l| 200 + l).collect()
+                } else {
+                    data[1..33].to_vec()
+                };
+                // getDimensions: (bytes - bias) / 12 elements, or bytes - bias.
+                want[31] = if by_element { 32 } else { 32 * 12 };
+                let by = if by_element { "element" } else { "byte" };
+                assert_eq!(words[0], want, "{label} ({tag}, by {by})");
+            }
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
