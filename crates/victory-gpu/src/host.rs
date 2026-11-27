@@ -1068,6 +1068,27 @@ impl Host {
         })
     }
 
+    /// Whether the host's waves have at most 32 lanes, 32 among them
+    /// (NVIDIA, Intel): `WaveSize(64)` is refused there, so wave64 compute
+    /// programs are translated for waves of 32
+    /// (`victory_shader::emit::Options::host_wave32`); logged once.
+    pub(crate) fn wave32(&self) -> bool {
+        static WAVE32: OnceLock<bool> = OnceLock::new();
+        *WAVE32.get_or_init(|| {
+            let host = victory_shader::emit::host::Host::from_device(self.device.clone());
+            match host.wave32() {
+                Ok(wave32) => {
+                    tracing::info!(wave32, "host waves of 32 lanes at most");
+                    wave32
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host wave lanes not known");
+                    false
+                }
+            }
+        })
+    }
+
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
     pub(crate) fn heap_atomics64(&self) -> bool {

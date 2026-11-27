@@ -86,25 +86,31 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
             hardware_adapter(&factory).map_err(err)?
         };
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-        let device = device.ok_or("no device")?;
-        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
-        };
-        device
-            .CheckFeatureSupport(
-                D3D12_FEATURE_SHADER_MODEL,
-                (&raw mut sm).cast(),
-                size_of_val(&sm) as u32,
-            )
-            .map_err(err)?;
-        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Err(format!(
-                "the device supports SM {:#x} only",
-                sm.HighestShaderModel.0
-            ));
-        }
-        Ok(device)
+        sm66(device.ok_or("no device")?)
     }
+}
+
+/// `device`, if it takes SM 6.6.
+fn sm66(device: ID3D12Device) -> Result<ID3D12Device, String> {
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: the query writes its own structure of the given size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut sm).cast(),
+            size_of_val(&sm) as u32,
+        )
+    }
+    .map_err(err)?;
+    if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+        return Err(format!(
+            "the device supports SM {:#x} only",
+            sm.HighestShaderModel.0
+        ));
+    }
+    Ok(device)
 }
 
 /// Whether `device` runs on a software adapter (WARP); `true` when that
@@ -195,6 +201,47 @@ impl Host {
         let warp = on_software_adapter(&device);
         Host { device, warp }
     }
+
+    /// Every hardware adapter (as [`hardware_adapter`] tells them) whose
+    /// device takes SM 6.6, by name: tests that compare GPUs of different
+    /// wave widths run on each.
+    pub fn each_hardware() -> Vec<(String, Self)> {
+        let mut hosts = Vec::new();
+        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return hosts;
+            };
+            for index in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(index) else {
+                    break;
+                };
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || desc.DedicatedVideoMemory == 0
+                {
+                    continue;
+                }
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&desc.Description);
+                if let Some(Ok(device)) = device.map(sm66) {
+                    let host = Host {
+                        device,
+                        warp: false,
+                    };
+                    hosts.push((name.trim_end_matches(char::from(0)).to_owned(), host));
+                }
+            }
+        }
+        hosts
+    }
+
 
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
@@ -595,6 +642,23 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether this device's waves have at most 32 lanes, 32 among them
+    /// (NVIDIA, Intel): it refuses `WaveSize(64)`, so translations for it
+    /// set [`super::Options::host_wave32`].
+    pub fn wave32(&self) -> Result<bool, String> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes its own structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((o.WaveLaneCountMin..=o.WaveLaneCountMax).contains(&32) && o.WaveLaneCountMax < 64)
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
@@ -797,6 +861,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave32: false,
         view_marks: false,
     })?;
     Ok(HostShader {

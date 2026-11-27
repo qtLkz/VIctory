@@ -105,3 +105,7 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+On hosts whose waves have at most 32 lanes, a console wave64 compute
+program runs as two host waves; what that keeps exact and what it refuses,
+operation by operation, is in [wave64-on-32-lane-hosts.md](wave64-on-32-lane-hosts.md).

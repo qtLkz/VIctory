@@ -92,6 +92,11 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Translate for a host whose waves have at most 32 lanes (NVIDIA,
+        /// Intel), as `run` does there: wave64 compute programs in halves.
+        /// With `--pipelines`, set by the GPU that makes them.
+        #[arg(long, conflicts_with = "cache")]
+        wave32: bool,
         /// Positive worker thread count (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
@@ -182,12 +187,14 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            wave32,
         } => translate::run(
             paths,
             validate,
             pipelines,
             list,
             jobs.map(NonZeroUsize::get),
+            wave32,
         ),
         Command::Run {
             exe,

@@ -188,6 +188,7 @@ fn program() -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave32: false,
         view_marks: false,
     })
     .expect("lower");
@@ -417,6 +418,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave32: false,
         view_marks: false,
     })
     .expect("lower");
@@ -559,6 +561,7 @@ fn writes_through_views_mark_their_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave32: false,
         view_marks: true,
     })
     .expect("lower");
@@ -675,6 +678,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            host_wave32: false,
             view_marks: true,
         })
         .expect("lower")
@@ -800,6 +804,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave32: false,
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes);

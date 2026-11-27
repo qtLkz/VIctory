@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave32: false,
         view_marks: false,
     })
     .expect("lower");
