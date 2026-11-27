@@ -30,7 +30,18 @@ pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+///
+/// The view space was `1 << 21`, the console-shaped heap the indices were
+/// first written for, but no D3D12 host can make one:
+/// `D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2` is 1 000 000
+/// descriptors (`victory-gpu`'s `PORTABLE_VIEWS`). A shader clamping an
+/// index to `1 << 21 - 1` therefore read a descriptor past the end of the
+/// heap it was given - past any heap that can exist - and the driver
+/// removes the device. The clamp is the largest heap a host may make, so
+/// every index it can produce is inside the heap; a title index above it
+/// reads a null slot, which is what the slots past a capped heap's title
+/// region are anyway.
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that

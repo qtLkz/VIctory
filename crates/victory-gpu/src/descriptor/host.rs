@@ -98,6 +98,27 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+/// Slots kept free at the top of a heap capped at [`PORTABLE_VIEWS`] for the
+/// null buffer views `victory_shader::emit::NULL_BUFFER_VIEW` names and the
+/// pairs beside them: with the clamp at the heap's size, the top of the heap
+/// is the only place they can be.
+const NULL_RESERVE: u32 = 1024;
+
+/// The slots of the capped layout when the title's `count` slots plus even the
+/// small dynamic range do not fit the clamp translated shaders use
+/// (`HEAP_VIEWS`): `(title slots kept, dynamic slots)`. `None` when they do.
+fn capped_layout(count: u32) -> Option<(u32, u32)> {
+    (count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS)
+        .then_some((PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC - NULL_RESERVE))
+}
+
+/// The heap a host that refuses the large dynamic range is asked for, given
+/// `count` title slots: never shorter than the clamp shaders use, or an index
+/// the shader clamps to would be past the heap's end (review on #2683: a heap
+/// of 865 536 slots for 800 000 title views).
+fn small_request(count: u32, views: u32) -> u32 {
+    (count + MIN_DYNAMIC).max(views)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -150,19 +171,30 @@ impl HostHeap {
                     return None;
                 }
             }
+        } else if let Some((slots, extra)) = capped_layout(count) {
+            // The title's slots plus even the small dynamic range do not fit
+            // the clamp translated shaders use (`HEAP_VIEWS`), so no layout
+            // gives this title dynamic slots a shader could reach - not on
+            // tier-3 hardware either, whose heaps are larger than that clamp.
+            // The cap is taken on every host so the layout stays the same
+            // everywhere: the top of the heap is the null buffer views, and
+            // nothing a shader clamps to is past the heap's end.
+            // shortcut: descriptors past the limit are left out; a title that
+            // reaches them needs remapping.
+            tracing::warn!(count, "host view heap capped at {PORTABLE_VIEWS}");
+            (make(PORTABLE_VIEWS).ok()?, slots, extra)
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
+            // A host that caps its heaps at `PORTABLE_VIEWS` (that is the
+            // tier-2 limit) gets the largest heap it will make - but never
+            // one shorter than `views`: a shader clamps its indices below
+            // `HEAP_VIEWS`, so a heap short of that lets the clamp name a
+            // slot the heap does not have (review: 800 000 title views made
+            // an 865 536-slot heap, and every index in 865 536..999 999 was
+            // out of bounds).
+            match make(small_request(count, views)) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -187,6 +219,16 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        // Every layout keeps the top of the heap free for the two raw
+        // null buffer views `NULL_BUFFER_VIEW` and the one below. The
+        // capped path stopped short of them already; the two successful
+        // ones did not, and there the null slots fell inside the dynamic
+        // range - the guard below then refused to install them, and a
+        // shader clamping an index to `HEAP_VIEWS - 1` named a slot a
+        // table had written (review on this PR: 737 856 and 934 464
+        // title views both end their dynamic range past 999 997 on a
+        // 1 000 000-slot heap).
+        let extra = extra.min(total.saturating_sub(count).saturating_sub(NULL_RESERVE));
         let h = HostHeap {
             heap,
             cpu,
@@ -1824,6 +1866,67 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout a view heap takes, at the title counts where a capped host
+    /// used to get a heap shorter than the clamp shaders index against
+    /// (review on #2683: 737 856, 800 000 and 934 464 title views), and past
+    /// the clamp, where the capped layout is taken on every host.
+    #[test]
+    fn the_capped_layout_and_the_small_range_fit_the_clamp_shaders_use() {
+        let views = victory_shader::emit::HEAP_VIEWS;
+        // The counts of the review fit: the host is asked for a heap of at
+        // least the clamp, so a clamped index is inside it.
+        for count in [0, 737_856, 800_000, 934_464] {
+            assert!(capped_layout(count).is_none(), "{count} fits");
+            assert!(
+                small_request(count, views) >= views,
+                "{count}: a heap of {} is short of the clamp {views}",
+                small_request(count, views)
+            );
+        }
+        // One past it: the capped layout, and its arithmetic closes.
+        for count in [934_465, 1_000_000, 1_050_000] {
+            let (slots, extra) = capped_layout(count).expect("a capped layout");
+            assert_eq!(slots, PORTABLE_VIEWS - MIN_DYNAMIC);
+            assert_eq!(extra, MIN_DYNAMIC - NULL_RESERVE);
+            assert!(slots + extra + NULL_RESERVE <= PORTABLE_VIEWS);
+            assert!(slots + extra < views, "{count}: the null views are inside the dynamic range");
+        }
+    }
+
+    /// On a host that makes the heap, the same invariant holds: every slot a
+    /// shader clamps to exists, the dynamic slots end below the null views and
+    /// the pairs end inside the heap.
+    #[test]
+    fn a_heap_has_every_slot_shaders_clamp_to() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let views = victory_shader::emit::HEAP_VIEWS;
+        for count in [737_856u32, 800_000, 934_464] {
+            let Some(h) = HostHeap::new(false, count) else {
+                continue; // this host makes no such heap at all
+            };
+            // SAFETY: a live heap.
+            let total = unsafe { h.heap.GetDesc().NumDescriptors };
+            assert!(total >= views, "{count}: a heap of {total} is short of the clamp {views}");
+            assert!(
+                h.count + h.dynamic + NULL_RESERVE <= total,
+                "{count}: {} + {} + {NULL_RESERVE} exceeds the heap's {total}",
+                h.count,
+                h.dynamic
+            );
+            assert!(h.pairs_end <= total, "{count}: the pairs end at {} of {total}", h.pairs_end);
+        }
+        // Past the clamp: the capped layout on every host, tier-3 included.
+        if let Some(h) = HostHeap::new(false, 1_050_000) {
+            // SAFETY: a live heap.
+            let total = unsafe { h.heap.GetDesc().NumDescriptors };
+            assert_eq!(h.count, PORTABLE_VIEWS - MIN_DYNAMIC);
+            assert_eq!(h.dynamic, MIN_DYNAMIC - NULL_RESERVE);
+            assert!(total >= views, "the capped heap is {total}, short of {views}");
+        }
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
